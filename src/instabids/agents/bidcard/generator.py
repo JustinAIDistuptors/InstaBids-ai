@@ -7,14 +7,13 @@ calculates confidence scores, and creates bid card entries in the database.
 """
 
 import logging
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import asyncio
-from ...tools.supabase.bid_cards import create_bid_card
-from .classifier import classify_project # This import will require classifier.py to be created
+from ..homeowner.classifier import classify_project_with_llm
 
 logger = logging.getLogger(__name__)
 
-# Categories and job types for classification
+# Categories and job types for classification (assuming these remain relevant for classifier)
 CATEGORIES = [
     "repair",
     "renovation",
@@ -90,58 +89,81 @@ JOB_TYPES = {
 }
 
 
-async def generate_bid_card(
-    project_id: str,
+async def generate_bid_card_data(
+    project_id: str, 
     project_data: Dict[str, Any],
-    photo_meta: Dict[str, Any] = None
+    photo_meta: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
-    Generate a bid card for a project.
+    Classifies the project and prepares data necessary for creating a bid card.
+    This function does NOT create the bid card in the database directly.
+    It returns a dictionary of parameters for the CreateBidCardTool.
     
     Args:
-        project_id: The ID of the project
+        project_id: The ID of the project.
         project_data: Project information including title, description, etc.
-        photo_meta: Metadata and analysis results from uploaded photos
+        photo_meta: Metadata and analysis results from uploaded photos.
         
     Returns:
-        A dictionary containing the created bid card information
+        A dictionary containing data prepared for bid card creation tool.
     """
-    logger.info(f"Generating bid card for project {project_id}")
+    logger.info(f"Preparing bid card data for project {project_id}")
     
     description = project_data.get("description", "")
     title = project_data.get("title", "")
     budget_range = project_data.get("budget_range", "")
     timeline = project_data.get("timeline", "")
     
-    category, job_type, confidence = await classify_project(
-        description=description,
-        title=title,
-        photo_meta=photo_meta or {}
+    current_photo_meta_list = photo_meta if photo_meta is not None else []
+
+    (
+        primary_category,
+        primary_job_type,
+        primary_confidence,
+        secondary_category,
+        secondary_job_type,
+        secondary_confidence,
+        tertiary_category,
+        tertiary_job_type,
+        tertiary_confidence,
+        classification_details
+    ) = await classify_project_with_llm(
+        project_description=description,
+        image_analysis_results=current_photo_meta_list 
     )
     
-    if photo_meta and photo_meta.get("labels"):
-        confidence = _adjust_confidence_with_vision(
-            confidence,
-            category,
-            job_type,
-            photo_meta
+    photo_meta_for_confidence_adjustment = current_photo_meta_list[0] if current_photo_meta_list else {}
+
+    if photo_meta_for_confidence_adjustment and photo_meta_for_confidence_adjustment.get("labels"):
+        primary_confidence = _adjust_confidence_with_vision(
+            primary_confidence,
+            primary_category,
+            primary_job_type,
+            photo_meta_for_confidence_adjustment
         )
     
-    status = "final" if confidence >= 0.7 else "draft"
+    status = "final" if primary_confidence >= 0.7 else "draft"
     
-    bid_card = await create_bid_card(
-        project_id=project_id,
-        category=category,
-        job_type=job_type,
-        budget_range=budget_range,
-        timeline=timeline,
-        photo_meta=photo_meta or {},
-        ai_confidence=confidence,
-        status=status
-    )
+    bid_card_tool_params = {
+        "project_id": project_id,
+        "primary_category": primary_category,
+        "primary_job_type": primary_job_type,
+        "primary_ai_confidence": primary_confidence,
+        "secondary_category": secondary_category,
+        "secondary_job_type": secondary_job_type,
+        "secondary_ai_confidence": secondary_confidence,
+        "tertiary_category": tertiary_category,
+        "tertiary_job_type": tertiary_job_type,
+        "tertiary_ai_confidence": tertiary_confidence,
+        "classification_details": classification_details, 
+        "budget_range": budget_range,
+        "timeline": timeline,
+        "photo_meta": current_photo_meta_list, 
+        "status": status
+    }
     
-    logger.info(f"Created bid card: {bid_card}")
-    return bid_card
+    logger.info(f"Prepared bid card data for CreateBidCardTool: {bid_card_tool_params}")
+    return bid_card_tool_params
 
 
 def _adjust_confidence_with_vision(
@@ -176,20 +198,19 @@ def _adjust_confidence_with_vision(
         }
         
         matching_keywords = 0
-        # Use .get(category, []) to provide a default empty list if category not in keywords
         keywords_for_category = category_keywords.get(category, [])
         total_keywords = len(keywords_for_category)
         
         if total_keywords > 0:
-            for label_obj in labels: # Assuming labels are dicts with 'description'
+            for label_obj in labels: 
                 label_description = label_obj.get("description", "").lower()
                 if any(keyword in label_description for keyword in keywords_for_category):
                     matching_keywords += 1
         
             if matching_keywords > 0:
-                vision_confidence = matching_keywords / total_keywords
-                adjusted_confidence = (base_confidence * 0.7) + (vision_confidence * 0.3)
-                return min(adjusted_confidence, 0.95)  # Cap at 0.95
+                vision_confidence_boost = (matching_keywords / total_keywords) * 0.2 
+                adjusted_confidence = base_confidence + vision_confidence_boost 
+                return min(adjusted_confidence, 0.99)  
         
         return base_confidence
         

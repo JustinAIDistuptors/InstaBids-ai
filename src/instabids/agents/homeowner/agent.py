@@ -1,339 +1,375 @@
 """
-HomeownerAgent implementation for InstaBids.
+Homeowner Agent for InstaBids.
 
-This agent handles homeowner interactions, project scoping, and bid card generation.
-It uses slot-filling to collect necessary project information and delegates to the
-BidCardModule for classification and bid card creation.
+This agent interacts with homeowners to gather project details, manage preferences,
+and orchestrate the creation of projects and bid cards using various ADK tools.
 """
-
-from typing import Dict, List, Optional, Any, AsyncGenerator
 import logging
-from google.adk.agents import LlmAgent
-from google.adk.events import Event
-from google.adk.agents.invocation_context import InvocationContext
-from google.adk.tools.tool_context import ToolContext
-from ...tools.supabase.projects import create_project_tool, update_project_tool
-from ...tools.supabase.preferences import get_user_preference_tool, set_user_preference_tool
-from ...tools.vision.image_analysis import analyze_image_tool
-from ..bidcard.generator import generate_bid_card
-from .prompts import SYSTEM_PROMPT, SLOT_FILLING_PROMPT
+from typing import Dict, Any, AsyncGenerator, Optional, List
+
+from google.adk.agents import LlmAgent, InvocationContext, Tool, Event
+import google.generativeai.types as glm # For ToolCall and ToolResult
+
+from .prompts import SYSTEM_PROMPT, SLOT_FILLING_PROMPT, BUDGET_EXTRACTION_PROMPT
+from .tools import ( # Assuming tools are correctly defined and imported
+    create_project_tool,
+    update_project_tool,
+    get_user_preference_tool,
+    set_user_preference_tool,
+    analyze_image_tool,
+    create_bid_card_tool,
+)
+from instabids.agents.bidcard.generator import generate_bid_card_data # Corrected import path
 
 logger = logging.getLogger(__name__)
 
-
 class HomeownerAgent(LlmAgent):
-    """
-    Agent that interacts with homeowners to scope projects and generate bid cards.
-    
-    This agent uses a conversational slot-filling approach to gather necessary
-    project information from the homeowner. It can recall user preferences from
-    previous interactions and delegates to the BidCardModule for project
-    classification and bid card generation.
-    """
-    
-    def __init__(
-        self,
-        model: str = "gemini-2.0-flash",
-        name: str = "HomeownerAgent",
-        description: str = "Helps homeowners scope projects and generates bid cards",
-    ):
-        """
-        Initialize the HomeownerAgent.
-        
-        Args:
-            model: The model to use for the agent (default: gemini-2.0-flash)
-            name: The name of the agent (default: HomeownerAgent)
-            description: A description of the agent's purpose
-        """
+    def __init__(self, **kwargs):
         super().__init__(
-            model=model,
-            name=name,
-            description=description,
-            instruction=SYSTEM_PROMPT,
             tools=[
                 create_project_tool,
                 update_project_tool,
                 get_user_preference_tool,
                 set_user_preference_tool,
                 analyze_image_tool,
+                create_bid_card_tool,
             ],
-            output_key="project_info"
+            **kwargs,
         )
-        self.required_slots = [
-            "title",
-            "description",
-            "zipcode",
-            "budget_range",
-            "timeline",
-        ]
-    
+        # Create a mapping from tool names to tool instances for easy lookup
+        self._tools_by_name: Dict[str, Tool] = {tool.name: tool for tool in self.tools}
+        logger.info(f"HomeownerAgent initialized with tools: {list(self._tools_by_name.keys())}")
+
+        self.agent_states = {
+            "GREETING": 0,
+            "LOADING_PREFERENCES": 1,
+            "ANALYZING_IMAGE": 2,
+            "SLOT_FILLING": 3,
+            "CREATING_PROJECT": 4,
+            "GENERATING_BID_CARD_DATA": 5,
+            "CREATING_BID_CARD": 6,
+            "COMPLETED": 7,
+            "ERROR": 8,
+        }
+
+    def _get_current_state_name(self, ctx: InvocationContext) -> str:
+        state_value = ctx.session.state.get("agent_internal_state", self.agent_states["GREETING"])
+        for name, val in self.agent_states.items():
+            if val == state_value:
+                return name
+        return "UNKNOWN_STATE"
+
+    def _extract_tool_calls_from_llm_response(
+        self, response: glm.GenerateContentResponse
+    ) -> List[glm.ToolCall]:
+        """Extracts tool calls from the LLM's response."""
+        tool_calls = []
+        if response and response.candidates:
+            for candidate in response.candidates:
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        if isinstance(part, glm.ToolCall):
+                            tool_calls.append(part)
+        return tool_calls
+
+    def _extract_text_from_llm_response(
+        self, response: glm.GenerateContentResponse
+    ) -> Optional[str]:
+        """Extracts the primary text content from the LLM's response."""
+        if response and response.text:
+            return response.text
+        # Fallback if text is not directly available but might be in parts
+        if response and response.candidates:
+            for candidate in response.candidates:
+                if candidate.content and candidate.content.parts:
+                    text_parts = [part.text for part in candidate.content.parts if hasattr(part, 'text')]
+                    if text_parts:
+                        return " ".join(text_parts).strip()
+        return None
+
+    async def _execute_tool_call(
+        self, ctx: InvocationContext, tool_call: glm.ToolCall
+    ) -> glm.ToolResult:
+        """Executes a single tool call and returns its result."""
+        tool_name = tool_call.function_call.name
+        tool_args = dict(tool_call.function_call.args)
+        tool_output_content = ""
+        error_occurred = False
+
+        if tool_name not in self._tools_by_name:
+            tool_output_content = f"Error: Tool '{tool_name}' not found or not registered with the agent."
+            logger.error(tool_output_content)
+            error_occurred = True
+        else:
+            actual_tool: Tool = self._tools_by_name[tool_name]
+            logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
+            try:
+                # Assuming tools have an 'arun' method for async execution
+                # and they return a dictionary or a serializable object.
+                tool_output_python = await actual_tool.arun(ctx, **tool_args) 
+                
+                # Process direct output and update state HERE
+                slots = ctx.session.state.get("slots", {})
+                self._handle_tool_output_and_update_state(ctx, tool_name, tool_output_python, slots)
+
+                # ADK expects the 'output' for ToolResult to be a string.
+                # We need to decide how to represent complex Python outputs.
+                # For now, let's assume a simple string conversion or a summary.
+                # This part is CRITICAL and depends on what the LLM expects back.
+                if isinstance(tool_output_python, dict):
+                    tool_output_content = str(tool_output_python) # Simple string representation
+                elif isinstance(tool_output_python, str):
+                    tool_output_content = tool_output_python
+                else:
+                    tool_output_content = f"Tool {tool_name} executed successfully (output type: {type(tool_output_python)})."
+                
+                logger.info(f"Tool {tool_name} executed. Raw Python output: {tool_output_python}")
+
+            except Exception as e:
+                tool_output_content = f"Error executing tool '{tool_name}': {str(e)}"
+                logger.exception(f"Exception while executing tool {tool_name}:")
+                error_occurred = True
+                ctx.session.state["agent_internal_state"] = self.agent_states["ERROR"]
+        
+        return glm.ToolResult(
+            part=glm.Part(function_response=glm.FunctionResponse(name=tool_name, response={"content": tool_output_content, "error": error_occurred})),
+            role="tool" # ADK might expect role='tool'
+        )
+
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        """
-        Implement the agent's core logic.
+        logger.info(f"HomeownerAgent _run_async_impl triggered. Invocation ID: {ctx.invocation_id}")
         
-        This method orchestrates the slot-filling process, preference management,
-        and bid card generation. It yields events as the conversation progresses.
-        
-        Args:
-            ctx: The invocation context containing session and state information
-            
-        Yields:
-            Events representing the agent's processing and responses
-        """
-        # Initialize slots with any existing project information
-        slots = ctx.session.state.get("slots", {})
-        
-        # If an image was uploaded, analyze it
-        if "image_path" in ctx.session.state:
-            image_path = ctx.session.state["image_path"]
-            logger.info(f"Analyzing image: {image_path}")
-            
-            # Call vision tool to analyze the image
-            image_analysis_result = await self._analyze_image(ctx, image_path)
-            
-            # Update state with image analysis results
-            ctx.session.state["photo_meta"] = image_analysis_result
-            
-            # Log the analysis result
-            logger.info(f"Image analysis complete: {image_analysis_result}")
-        
-        # Look up user preferences if we don't have all required slots
-        if not self._all_slots_filled(slots):
-            logger.info("Not all slots filled, retrieving user preferences")
-            await self._load_user_preferences(ctx, slots)
-        
-        # Main conversation loop for slot-filling
-        while not self._all_slots_filled(slots):
-            # Prepare slot-filling prompt based on current slots
-            next_prompt = self._prepare_slot_filling_prompt(slots)
-            
-            # Get user's response
-            user_message = await self._get_user_message(ctx) # This method needs to be defined or imported
-            
-            # Extract information from user message and update slots
-            # This method also needs to be defined or the logic implemented here
-            updated_slots = await self._extract_slots_from_message(ctx, user_message, slots) 
-            slots.update(updated_slots)
-            
-            # Store any extracted preferences
-            if "budget_range" in updated_slots and updated_slots["budget_range"]:
-                await self._store_user_preference(
-                    ctx, "default_budget", updated_slots["budget_range"], 0.8
-                )
-            
-            # Update session state with current slots
-            ctx.session.state["slots"] = slots
-            
-            # Yield updated state to ensure persistence
-            yield Event(
-                author=self.name,
-                actions=Event.Actions(state_delta={"slots": slots})
-            )
-            
-            # If still missing slots, ask for more information
-            if not self._all_slots_filled(slots):
-                response = f"I need a bit more information to complete your project. {next_prompt}"
-                yield Event.for_text(self.name, response)
-        
-        # All slots filled, create the project
-        logger.info(f"All slots filled: {slots}")
-        project_id = await self._create_project(ctx, slots)
-        
-        # Generate bid card
-        if project_id:
-            bid_card = await self._generate_bid_card(ctx, project_id, slots)
-            
-            # Update session state with completed project and bid card info
-            ctx.session.state["project_id"] = project_id
-            ctx.session.state["bid_card_id"] = bid_card["id"]
-            
-            # Yield updated state
-            yield Event(
-                author=self.name,
-                actions=Event.Actions(
-                    state_delta={
-                        "project_id": project_id,
-                        "bid_card_id": bid_card["id"]
-                    }
-                )
-            )
-            
-            # Prepare final response with bid card details
-            confidence_level = "high" if bid_card["ai_confidence"] >= 0.7 else "moderate"
-            final_response = (
-                f"Great! I've created your project and generated a bid card. "
-                f"Your project has been classified as a {bid_card['category']} > {bid_card['job_type']} "
-                f"with {confidence_level} confidence. "
-                f"Once you confirm the details look good, I'll help find contractors for your {bid_card['category']} project."
-            )
-            
-            # Return final response
-            yield Event.for_text(self.name, final_response)
-    
-    def _all_slots_filled(self, slots: Dict[str, Any]) -> bool:
-        """Check if all required slots are filled."""
-        return all(slot in slots and slots[slot] for slot in self.required_slots)
-    
-    def _prepare_slot_filling_prompt(self, slots: Dict[str, Any]) -> str:
-        """Prepare the next prompt based on missing slots."""
-        missing_slots = [slot for slot in self.required_slots if slot not in slots or not slots[slot]]
-        
-        if "title" in missing_slots:
-            return "What's a good title for your project?"
-        elif "description" in missing_slots:
-            return "Please describe your project in detail. What specifically needs to be done?"
-        elif "zipcode" in missing_slots:
-            return "What's the zipcode where the project will take place?"
-        elif "budget_range" in missing_slots:
-            return "What's your budget range for this project?"
-        elif "timeline" in missing_slots:
-            return "When would you like this project to be completed?"
-        
-        return "Is there anything else you'd like to add about your project?"
+        # Initialize session state if not present
+        if "slots" not in ctx.session.state:
+            ctx.session.state["slots"] = {}
+        if "agent_internal_state" not in ctx.session.state:
+            ctx.session.state["agent_internal_state"] = self.agent_states["GREETING"]
+        if "user_id" not in ctx.session.state: # Assuming user_id is set externally or via a login flow
+            ctx.session.state["user_id"] = "default_user_123" # Placeholder
+            logger.warning("user_id not found in session, using placeholder.")
 
-    async def _get_user_message(self, ctx: InvocationContext) -> str:
-        """Placeholder for getting user message. ADK likely provides a way to get the last user utterance."""
-        # This needs to be implemented based on how ADK provides user input
-        # For now, returning a placeholder or raising NotImplementedError
-        if ctx.history and ctx.history[-1].author == "user":
-             return ctx.history[-1].text
-        logger.warning("_get_user_message needs proper implementation based on ADK context.")
-        return "Placeholder user message - replace with actual user input mechanism."
+        slots = ctx.session.state["slots"]
+        current_state_value = ctx.session.state["agent_internal_state"]
+        current_state_name = self._get_current_state_name(ctx)
 
-    async def _extract_slots_from_message(self, ctx: InvocationContext, user_message: str, current_slots: Dict[str, Any]) -> Dict[str, Any]:
-        """Placeholder for extracting slots from user message using LLM or regex."""
-        # This method needs to be implemented. It might involve another LLM call
-        # or specific parsing logic based on expected user responses.
-        # For now, it's a placeholder.
-        logger.warning("_extract_slots_from_message needs proper implementation.")
-        extracted_slots = {}
-        # Example (very naive) - a real implementation would use LLM or robust parsing
-        if "title" not in current_slots or not current_slots["title"]:
-            # In a real scenario, you'd use an LLM call with a specific prompt
-            # to extract the title from user_message
-            pass # Placeholder
-        # ... and so on for other slots
-        return extracted_slots
-    
-    async def _load_user_preferences(self, ctx: InvocationContext, slots: Dict[str, Any]):
-        """Load user preferences and update slots with defaults if available."""
-        try:
-            user_id = ctx.session.user_id
-            if not user_id:
-                logger.warning("User ID not found in session, cannot load preferences.")
-                return
+        logger.info(f"Current agent state: {current_state_name} ({current_state_value})")
+        logger.info(f"Current slots: {slots}")
+        logger.info(f"User input for this turn: {ctx.get_last_user_message()}")
+
+        # --- Main Agent Logic based on State ---
+        if current_state_value == self.agent_states["ERROR"]:
+            yield Event(author=self.name, content="I seem to have encountered an issue. Could you please try rephrasing or starting over?", invocation_id=ctx.invocation_id)
+            ctx.end_invocation = True
+            return
+
+        if current_state_value == self.agent_states["COMPLETED"]:
+            yield Event(author=self.name, content="Project and bid card creation process is complete. What would you like to do next?", invocation_id=ctx.invocation_id)
+            ctx.end_invocation = True # Or transition to another state
+            return
+
+        # Construct conversation history for the LLM
+        # This needs to be built from ctx.history or similar ADK mechanism
+        # For now, let's build a simplified history
+        conversation_history = [glm.Content(parts=[glm.Part(text=SYSTEM_PROMPT)], role="system")] # System prompt first
+        # Add previous turns from ADK's history if available
+        # For example: for turn in ctx.history: conversation_history.append(turn)
+        # Then add current user message
+        last_user_message = ctx.get_last_user_message()
+        if last_user_message:
+            conversation_history.append(glm.Content(parts=[glm.Part(text=last_user_message)], role="user"))
+        else: # First turn, no user message yet (e.g. agent starts convo)
+            if current_state_value == self.agent_states["GREETING"]:
+                 conversation_history.append(glm.Content(parts=[glm.Part(text="Initiate greeting.")], role="user")) # Simulate trigger
+
+        # Add specific prompt based on state if needed (e.g. SLOT_FILLING_PROMPT)
+        if current_state_value == self.agent_states["SLOT_FILLING"]:
+            # The SLOT_FILLING_PROMPT is now part of SYSTEM_PROMPT's guidance
+            # but could be added here if more specific turn-based instruction is needed.
+            pass 
+
+        # --- LLM Interaction --- 
+        logger.debug(f"Sending content to LLM. History length: {len(conversation_history)}")
+        llm_response: glm.GenerateContentResponse = await ctx.llm.generate_content_async(
+            contents=conversation_history,
+            # tools=self.tools, # ADK's LlmAgent might handle this internally if tools are in __init__
+            # tool_config=glm.ToolConfig(...) # If specific tool config needed
+        )
+
+        tool_calls_requested = self._extract_tool_calls_from_llm_response(llm_response)
+        final_text_response_to_user = self._extract_text_from_llm_response(llm_response)
+
+        if tool_calls_requested:
+            logger.info(f"LLM requested {len(tool_calls_requested)} tool call(s).")
+            tool_results: List[glm.ToolResult] = []
+            for tool_call in tool_calls_requested:
+                tool_execution_result = await self._execute_tool_call(ctx, tool_call)
+                tool_results.append(tool_execution_result)
             
-            budget_preference = await get_user_preference_tool(
-                user_id=user_id,
-                preference_key="default_budget",
-                tool_context=ToolContext(
-                    state=ctx.session.state,
-                    agent_name=self.name,
-                    function_call_id="load_preferences"
-                )
+            # Update conversation history with the LLM's previous request and our tool results
+            conversation_history.append(llm_response.candidates[0].content) # Add LLM's turn that requested tools
+            conversation_history.append(glm.Content(parts=tool_results, role="tool")) # Add all tool results
+
+            logger.debug(f"Sending tool results back to LLM. History length: {len(conversation_history)}")
+            final_llm_response: glm.GenerateContentResponse = await ctx.llm.generate_content_async(
+                contents=conversation_history
             )
-            
-            if budget_preference and "budget_range" not in slots:
-                slots["budget_range"] = budget_preference
-                logger.info(f"Loaded default budget preference: {budget_preference}")
+            final_text_response_to_user = self._extract_text_from_llm_response(final_llm_response)
+            if final_text_response_to_user:
+                logger.info(f"LLM response after tool execution: {final_text_response_to_user[:100]}...")
+            else:
+                logger.warning("LLM provided no text response after tool execution.")
+                final_text_response_to_user = "I've processed that using my tools. What's next?" # Fallback
+        else:
+            if final_text_response_to_user:
+                logger.info(f"LLM response (no tools called): {final_text_response_to_user[:100]}...")
+            else:
+                logger.warning("LLM provided no text response and no tools were called.")
+                final_text_response_to_user = "I'm sorry, I didn't quite understand. Could you rephrase?" # Fallback
+
+        # --- Update Agent State based on LLM response and current state ---
+        # This logic needs to be robust. The LLM (guided by prompts) and tool outputs should drive state changes.
+        # For now, a simplified state update based on slots and current state.
         
-        except Exception as e:
-            logger.error(f"Error loading user preferences: {e}")
-    
-    async def _store_user_preference(
-        self, ctx: InvocationContext, key: str, value: Any, confidence: float
+        # Example state transition logic (needs to be more sophisticated)
+        if current_state_value == self.agent_states["GREETING"]:
+            ctx.session.state["agent_internal_state"] = self.agent_states["SLOT_FILLING"] 
+            # Potentially LOADING_PREFERENCES or ANALYZING_IMAGE if conditions met
+            if ctx.session.state.get("user_id") and not slots.get("budget_range"):
+                 # Prompt implies GetUserPreferenceTool might be used by LLM here
+                 pass 
+            if ctx.session.state.get("image_path") and not ctx.session.state.get("photo_meta"):
+                # Prompt implies AnalyzeImageTool might be used by LLM here
+                pass
+        
+        elif current_state_value == self.agent_states["SLOT_FILLING"]:
+            if self._all_slots_filled(slots):
+                # LLM should confirm before this state transition implicitly happens.
+                # The SYSTEM_PROMPT instructs LLM to confirm before CreateProjectTool.
+                # This agent state transition should occur *after* LLM confirms and requests CreateProjectTool.
+                # For now, we assume if LLM doesn't ask more questions and slots are full, it's time for project creation.
+                # A more robust way is for LLM to output a specific signal or the CreateProjectTool call itself signals this transition.
+                # If 'project_id' is now in state (from CreateProjectTool via _handle_tool_output_and_update_state):
+                if ctx.session.state.get("project_id"):
+                    ctx.session.state["agent_internal_state"] = self.agent_states["GENERATING_BID_CARD_DATA"]
+                else: # Slots are filled, but project not yet created. LLM should be prompting to create it.
+                    logger.info("All slots filled, expecting LLM to confirm and request project creation.")
+        
+        elif current_state_value == self.agent_states["GENERATING_BID_CARD_DATA"]:
+            project_id = ctx.session.state.get("project_id")
+            if project_id:
+                project_data_for_bid_card = { # Gather data for generate_bid_card_data
+                    "title": slots.get("title"),
+                    "description": slots.get("description"),
+                    "zip_code": slots.get("zipcode"), # Ensure key matches generate_bid_card_data expectation
+                    "budget_range": slots.get("budget_range"),
+                    "timeline": slots.get("timeline"),
+                    "owner_id": ctx.session.state.get("user_id")
+                }
+                photo_meta = ctx.session.state.get("photo_meta")
+                try:
+                    bid_card_params = await generate_bid_card_data(project_id, project_data_for_bid_card, photo_meta)
+                    ctx.session.state["bid_card_params"] = bid_card_params
+                    ctx.session.state["agent_internal_state"] = self.agent_states["CREATING_BID_CARD"]
+                    logger.info("Bid card data generated, transitioning to CREATING_BID_CARD state.")
+                    # The LLM should now be prompted to use CreateBidCardTool with these params
+                    # We might need to re-engage LLM here to inform it that bid_card_params are ready.
+                    # For now, we assume next turn's SYSTEM_PROMPT/context will guide it.
+                    final_text_response_to_user = "I've prepared the details for the bid card. Let's get that created." # Override LLM text for this transition
+                except Exception as e:
+                    logger.exception("Error calling generate_bid_card_data:")
+                    ctx.session.state["agent_internal_state"] = self.agent_states["ERROR"]
+                    final_text_response_to_user = "I encountered an issue preparing the bid card data."
+            else:
+                logger.error("In GENERATING_BID_CARD_DATA state but no project_id found.")
+                ctx.session.state["agent_internal_state"] = self.agent_states["ERROR"]
+
+        elif current_state_value == self.agent_states["CREATING_BID_CARD"]:
+            # LLM should be guided by SYSTEM_PROMPT to use CreateBidCardTool if bid_card_params are available.
+            # If 'bid_card_id' is now in state (from CreateBidCardTool via _handle_tool_output_and_update_state):
+            if ctx.session.state.get("bid_card_id"):
+                ctx.session.state["agent_internal_state"] = self.agent_states["COMPLETED"]
+                logger.info("Bid card created, transitioning to COMPLETED state.")
+            else:
+                logger.info("Waiting for LLM to use CreateBidCardTool or for tool result.")
+
+        # Yield the final text response to the user.
+        yield Event(author=self.name, content=final_text_response_to_user, invocation_id=ctx.invocation_id)
+        logger.info(f"Yielding event with content: {final_text_response_to_user[:100]}...")
+        logger.info(f"Next agent state: {self._get_current_state_name(ctx)}")
+
+    def _handle_tool_output_and_update_state(
+        self, ctx: InvocationContext, tool_name: str, tool_output: Any, slots: Dict[str, Any]
     ):
-        """Store a user preference with confidence score."""
-        try:
-            user_id = ctx.session.user_id
-            if not user_id:
-                logger.warning("User ID not found in session, cannot store preference.")
-                return
-            
-            await set_user_preference_tool(
-                user_id=user_id,
-                preference_key=key,
-                preference_value=value,
-                confidence=confidence,
-                tool_context=ToolContext(
-                    state=ctx.session.state,
-                    agent_name=self.name,
-                    function_call_id="store_preference"
-                )
-            )
-            
-            logger.info(f"Stored user preference: {key}={value} (confidence={confidence})")
+        """
+        Processes the direct Python output from a tool call and updates session state.
+        This is called immediately after a tool's `arun` method completes.
+        """
+        logger.info(f"Handling output from tool '{tool_name}'. Output: {str(tool_output)[:200]}...")
+
+        if tool_name == get_user_preference_tool.name:
+            if isinstance(tool_output, dict) and tool_output.get("preference_key") == "default_budget" and tool_output.get("value"):
+                if not slots.get("budget_range"):
+                    slots["budget_range"] = tool_output["value"]
+                    logger.info(f"Applied preference from GetUserPreferenceTool: budget_range set to {slots['budget_range']}")
+                    ctx.session.state["slots"] = slots
         
-        except Exception as e:
-            logger.error(f"Error storing user preference: {e}")
-    
-    async def _analyze_image(self, ctx: InvocationContext, image_path: str) -> Dict[str, Any]:
-        """Analyze an uploaded image using the vision tool."""
-        try:
-            result = await analyze_image_tool(
-                image_path=image_path,
-                tool_context=ToolContext(
-                    state=ctx.session.state,
-                    agent_name=self.name,
-                    function_call_id="analyze_image"
-                )
-            )
-            return result
-        except Exception as e:
-            logger.error(f"Error analyzing image: {e}")
-            return {"error": str(e)}
-    
-    async def _create_project(self, ctx: InvocationContext, slots: Dict[str, Any]) -> Optional[str]:
-        """Create a project in the database using filled slots."""
-        try:
-            user_id = ctx.session.user_id
-            if not user_id:
-                logger.error("User ID not found in session, cannot create project.")
-                return None
-            
-            result = await create_project_tool(
-                owner_id=user_id,
-                title=slots["title"],
-                description=slots["description"],
-                zipcode=slots["zipcode"],
-                status="scoping",
-                tool_context=ToolContext(
-                    state=ctx.session.state,
-                    agent_name=self.name,
-                    function_call_id="create_project"
-                )
-            )
-            
-            logger.info(f"Created project: {result}")
-            return result["id"]
+        elif tool_name == analyze_image_tool.name:
+            ctx.session.state["photo_meta"] = tool_output
+            logger.info(f"Image analysis result from AnalyzeImageTool processed and stored in photo_meta.")
+
+        elif tool_name == create_project_tool.name:
+            project_id = tool_output.get("project_id") if isinstance(tool_output, dict) else None
+            if project_id:
+                ctx.session.state["project_id"] = project_id
+                logger.info(f"Project creation result from CreateProjectTool processed. Project ID: {project_id}")
+                # State transition to GENERATING_BID_CARD_DATA might happen in main loop after LLM confirms
+            else:
+                logger.error(f"CreateProjectTool output did not contain a 'project_id'. Output: {tool_output}")
+                ctx.session.state["agent_internal_state"] = self.agent_states["ERROR"]
+
+        elif tool_name == create_bid_card_tool.name:
+            bid_card_id = tool_output.get("bid_card_id") if isinstance(tool_output, dict) else None
+            if bid_card_id:
+                ctx.session.state["bid_card_id"] = bid_card_id
+                logger.info(f"Bid card creation result from CreateBidCardTool processed. Bid Card ID: {bid_card_id}")
+                # State transition to COMPLETED might happen in main loop after LLM confirms
+            else:
+                logger.error(f"CreateBidCardTool output did not contain a 'bid_card_id'. Output: {tool_output}")
+                ctx.session.state["agent_internal_state"] = self.agent_states["ERROR"]
         
-        except Exception as e:
-            logger.error(f"Error creating project: {e}")
-            return None
-    
-    async def _generate_bid_card(
-        self, ctx: InvocationContext, project_id: str, slots: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Generate a bid card for the project using the BidCardModule."""
-        try:
-            photo_meta = ctx.session.state.get("photo_meta", {})
-            
-            bid_card = await generate_bid_card(
-                project_id=project_id,
-                project_data=slots,
-                photo_meta=photo_meta
-            )
-            
-            logger.info(f"Generated bid card: {bid_card}")
-            return bid_card
+        elif tool_name == set_user_preference_tool.name:
+            logger.info(f"SetUserPreferenceTool was called and executed. Output: {tool_output}")
+            # Confirmation to user is handled by LLM based on prompts.
+
+        elif tool_name == update_project_tool.name:
+            logger.info(f"UpdateProjectTool was called and executed. Output: {tool_output}")
+            # Specific state updates for update_project would go here if needed.
+
+        else:
+            logger.warning(f"Received output from an unhandled tool in _handle_tool_output_and_update_state: {tool_name}")
+
+
+    def _all_slots_filled(self, slots: Dict[str, Any]) -> bool:
+        """Checks if all required slots are filled."""
+        required_slots = ["title", "description", "zipcode", "budget_range", "timeline"]
+        for slot_name in required_slots:
+            if not slots.get(slot_name):
+                logger.debug(f"Slot '{slot_name}' is not filled.")
+                return False
+        logger.info("All required slots are filled.")
+        return True
+
+    async def _get_budget_from_text(self, ctx: InvocationContext, text: str) -> Optional[str]:
+        """Uses LLM to extract budget range from text if direct extraction fails."""
+        # This method might be simplified or removed if the main LLM handles budget extraction well.
+        prompt = BUDGET_EXTRACTION_PROMPT.format(text_to_analyze=text)
+        logger.info("Attempting to extract budget using BUDGET_EXTRACTION_PROMPT.")
         
-        except Exception as e:
-            logger.error(f"Error generating bid card: {e}")
-            return {
-                "id": "error",
-                "project_id": project_id,
-                "category": "unknown",
-                "job_type": "unknown",
-                "ai_confidence": 0.0,
-                "status": "draft"
-            }
+        response = await ctx.llm.generate_content_async(contents=[glm.Content(parts=[glm.Part(text=prompt)], role="user")])
+        extracted_budget = self._extract_text_from_llm_response(response)
+        
+        if extracted_budget and "none" not in extracted_budget.lower(): # Basic check
+            logger.info(f"Budget extracted via LLM: {extracted_budget}")
+            return extracted_budget
+        logger.warning("Could not extract budget using BUDGET_EXTRACTION_PROMPT.")
+        return None
