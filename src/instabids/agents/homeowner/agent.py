@@ -12,9 +12,9 @@ from google.adk.agents import LlmAgent
 from google.adk.events import Event
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.tools.tool_context import ToolContext
-from ...tools.supabase.projects import create_project, update_project
-from ...tools.supabase.preferences import get_user_preference, set_user_preference
-from ...tools.vision.image_analysis import analyze_image
+from ...tools.supabase.projects import create_project_tool, update_project_tool
+from ...tools.supabase.preferences import get_user_preference_tool, set_user_preference_tool
+from ...tools.vision.image_analysis import analyze_image_tool
 from ..bidcard.generator import generate_bid_card
 from .prompts import SYSTEM_PROMPT, SLOT_FILLING_PROMPT
 
@@ -51,11 +51,11 @@ class HomeownerAgent(LlmAgent):
             description=description,
             instruction=SYSTEM_PROMPT,
             tools=[
-                create_project,
-                update_project,
-                get_user_preference,
-                set_user_preference,
-                analyze_image,
+                create_project_tool,
+                update_project_tool,
+                get_user_preference_tool,
+                set_user_preference_tool,
+                analyze_image_tool,
             ],
             output_key="project_info"
         )
@@ -223,7 +223,7 @@ class HomeownerAgent(LlmAgent):
                 logger.warning("User ID not found in session, cannot load preferences.")
                 return
             
-            budget_preference = await get_user_preference(
+            budget_preference = await get_user_preference_tool(
                 user_id=user_id,
                 preference_key="default_budget",
                 tool_context=ToolContext(
@@ -250,7 +250,7 @@ class HomeownerAgent(LlmAgent):
                 logger.warning("User ID not found in session, cannot store preference.")
                 return
             
-            await set_user_preference(
+            await set_user_preference_tool(
                 user_id=user_id,
                 preference_key=key,
                 preference_value=value,
@@ -270,7 +270,7 @@ class HomeownerAgent(LlmAgent):
     async def _analyze_image(self, ctx: InvocationContext, image_path: str) -> Dict[str, Any]:
         """Analyze an uploaded image using the vision tool."""
         try:
-            result = await analyze_image(
+            result = await analyze_image_tool(
                 image_path=image_path,
                 tool_context=ToolContext(
                     state=ctx.session.state,
@@ -291,7 +291,7 @@ class HomeownerAgent(LlmAgent):
                 logger.error("User ID not found in session, cannot create project.")
                 return None
             
-            result = await create_project(
+            result = await create_project_tool(
                 owner_id=user_id,
                 title=slots["title"],
                 description=slots["description"],
