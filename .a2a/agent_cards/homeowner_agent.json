@@ -1,0 +1,62 @@
+{
+  "name": "InstaBids HomeownerAgent",
+  "description": "Assists homeowners in creating and managing home improvement projects, helps scope projects, and generates structured bid cards for contractors to review.",
+  "url": "http://localhost:8000/a2a/v1",
+  "provider": {
+    "organization": "InstaBids",
+    "url": "https://instabids.example.com"
+  },
+  "version": "0.1.0",
+  "documentationUrl": "https://instabids.example.com/docs/homeowner-agent",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "stateTransitionHistory": true
+  },
+  "authentication": {
+    "schemes": ["Bearer"]
+  },
+  "defaultInputModes": ["text/plain", "image/jpeg", "image/png"],
+  "defaultOutputModes": ["text/plain", "application/json"],
+  "skills": [
+    {
+      "id": "project-creation",
+      "name": "Project Creation",
+      "description": "Creates new home improvement projects by gathering details through conversation and generating structured bid cards",
+      "tags": ["home-improvement", "projects", "bidding", "slot-filling"],
+      "examples": [
+        "I need to renovate my bathroom",
+        "My roof is leaking and needs repair",
+        "I want to install new hardwood floors in my living room"
+      ],
+      "inputModes": ["text/plain", "image/jpeg", "image/png"],
+      "outputModes": ["text/plain", "application/json"]
+    },
+    {
+      "id": "project-scoping",
+      "name": "Project Scoping",
+      "description": "Helps homeowners define the scope of their projects by asking relevant questions about details, budget, and timeline",
+      "tags": ["scoping", "project-management", "budgeting", "planning"],
+      "examples": [
+        "How much would you like to spend on this project?",
+        "When would you like this project to be completed?",
+        "What specific areas of your home need renovation?"
+      ],
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/plain"]
+    },
+    {
+      "id": "image-analysis",
+      "name": "Project Image Analysis",
+      "description": "Analyzes images of the project area to extract details and improve project classification and bidding",
+      "tags": ["image-analysis", "computer-vision", "project-classification"],
+      "examples": [
+        "Here's a picture of my leaking roof",
+        "Can you analyze this image of my bathroom?",
+        "I'm uploading photos of the damage"
+      ],
+      "inputModes": ["image/jpeg", "image/png"],
+      "outputModes": ["text/plain", "application/json"]
+    }
+  ]
+}

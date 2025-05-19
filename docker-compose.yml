@@ -1,0 +1,117 @@
+version: '3.8'
+
+services:
+  # Supabase local development stack
+  # Uses official Supabase Docker images where possible
+  # For a full local Supabase setup, refer to: https://supabase.com/docs/guides/hosting/docker
+  
+  db:
+    image: supabase/postgres:15.1.0.118 # Specify a version for stability
+    ports:
+      - "54323:5432" # Host port:Container port for DB
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres # Keep this secure if exposing DB, for local dev it's fine
+      POSTGRES_DB: postgres
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d # Auto-runs *.sql files on init
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Kong - API Gateway (as per Supabase local dev setup)
+  # Ensure you have a kong.yml configuration if using this for Supabase services
+  # This kong.yml is usually provided by 'supabase init' or 'supabase start'
+  kong:
+    image: kong/kong-gateway:3.4.1 # Specify a version
+    ports:
+      - "54321:8000" # Host port for Kong (Supabase API access)
+      - "54322:8443" # Host port for Kong admin (if needed)
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /etc/kong/kong.yaml # Note .yaml extension
+      KONG_DNS_ORDER: LAST,A,CNAME # Recommended by Supabase docs
+      KONG_PLUGINS: bundled,postgrest # Ensure postgrest is available if using Supabase REST
+      KONG_PG_HOST: db # Service name of your database
+      KONG_PG_USER: postgres
+      KONG_PG_PASSWORD: postgres 
+    volumes:
+      # You'd need a kong.yaml file. For a basic setup without full Supabase features through Kong,
+      # this might be simpler or you might directly connect to PostgREST if you run it.
+      # For now, assuming a placeholder or that it will be added.
+      - ./supabase_config/kong.yaml:/etc/kong/kong.yaml:ro 
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Supabase Studio - Optional, for DB management UI
+  # Typically connects to Kong, which then proxies to other Supabase services.
+  studio:
+    image: supabase/studio:20240301 # Specify a version
+    ports:
+      - "54324:3000" # Host port for Studio UI
+    environment:
+      SUPABASE_URL: http://kong:8000 # URL of your Kong gateway
+      # The following keys are default non-JWT Supabase keys. Replace if you have custom ones.
+      SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+      SUPABASE_SERVICE_ROLE_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU
+    depends_on:
+      kong:
+        condition: service_started # Kong might take a moment to configure
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+  
+  # Backend API (Python/FastAPI)
+  api:
+    build:
+      context: . # Assumes Dockerfile is in the root directory
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      SUPABASE_URL: http://kong:8000 # Connect to Supabase via Kong
+      SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+      SUPABASE_SERVICE_ROLE_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU
+      OPENAI_API_KEY: ${OPENAI_API_KEY} # Pass through from .env file
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY} # Pass through from .env file
+      ALLOWED_ORIGINS: http://localhost:3000,http://frontend:3000 # Allow frontend origin
+    volumes:
+      - ./src/instabids:/app/src/instabids # Mount your source code for hot reloading
+      # Add other necessary volume mounts if needed (e.g., config files)
+    command: uvicorn src.instabids.api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/src/instabids
+    depends_on:
+      db:
+        condition: service_healthy
+      kong:
+        condition: service_started # Ensure Kong is up before API tries to connect to Supabase via Kong
+    restart: unless-stopped
+  
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: ./frontend # Assumes Dockerfile is in ./frontend directory
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000 # API running on host via port mapping
+      NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321 # Supabase (Kong) running on host via port mapping
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+      # CHOKIDAR_USEPOLLING: "true" # May be needed for hot-reloading in Docker on some systems
+    volumes:
+      - ./frontend:/app # Mount frontend source code
+      - /app/node_modules # Don't mount host node_modules
+      - /app/.next # Don't mount host .next build artifacts
+    command: pnpm dev # Or your specific command to run the dev server
+    depends_on:
+      - api # Frontend depends on the backend API
+    restart: unless-stopped
+
+volumes:
+  supabase-db-data: # Persistent volume for Supabase PostgreSQL data
